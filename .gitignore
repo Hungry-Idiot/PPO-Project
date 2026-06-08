@@ -1,0 +1,39 @@
+# Docker image (1.5GB)
+battle_server.tar
+
+# Training outputs
+Python/output/
+Python/model/
+Python/logs/
+*.zip
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude local config
+.claude/
+
+# UE5 Engine binaries (large)
+Engine/
+Windows/
+TinyEngine/
+课程平台使用说明/
+MATLAB/
+
+# MATLAB build cache
+MATLAB/slprj/
+
+# Profiling
+*.out
+
+
