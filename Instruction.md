@@ -2,7 +2,7 @@
 
 ## 1. 项目目标
 
-使用 **PPO（Proximal Policy Optimization, Stable-Baselines3）** 训练战斗机智能体，在 UE5 仿真中**击败固定靶机（Fixed Target Drone）**。
+使用 **PPO（Proximal Policy Optimization, Stable-Baselines3）** 训练战斗机智能体，在 UE5 仿真中击败敌方战机（**Fixed Target → Simple 移动靶，渐进升级**）。
 
 ## 2. 系统架构
 
@@ -54,6 +54,7 @@ SENDING_PACKET_FORMAT = "<5d"
 ```
 Python/
 ├── main.py              # 训练入口，PPO 超参
+├── evaluate.py          # 模型评估：加载训练权重，确定性推理，观察 UE5 行为
 ├── config/envs.yaml     # host: 127.0.0.1, port: 1000
 ├── envs/train_env.py    # Gymnasium Env (TrainEnv)
 ├── utils/
@@ -67,7 +68,9 @@ Python/
 ├── diagnose_env.py      # 环境连通性诊断
 ├── diagnose_combat.py   # 交战距离诊断（PID 导引）
 ├── diagnose_damage_short.py  # 武器伤害验证（超近距离 + 零操作）
-└── diagnose_weapon_range.py  # 武器攻击范围测量（单连接二分搜索）
+├── diagnose_damage_short.py  # 武器伤害验证（超近距离 + 零操作）
+├── diagnose_weapon_range.py  # 武器攻击范围测量（单连接二分搜索）
+└── diagnose_simple_vs_simple.py  # Simple vs Simple 双连接诊断
 ```
 
 ### 4.1 观测空间（21 维）
@@ -92,26 +95,30 @@ action = [throttle, pitch, roll, yaw]  # 全部 ∈ [-1, 1]
 # pitch/roll/yaw: 直接透传
 ```
 
-### 4.3 奖励函数（reward.py — 当前版本）
+### 4.3 奖励函数（reward.py — 当前版本，Run 12 验证成功）
 ```python
-damage_reward:   damage_dealt * 2.0 - damage_taken * 1.5
-heading_reward:  heading_dot * 2.0        # 机头点积×2，无阈值
-approach_reward: (prev_dist - curr_dist) * 2.0
-speed_reward:    <50=-1.0, 50-100=线性, >=100=0.2
-step_penalty:    -0.02
-altitude_penalty: -10.0 if z < 50 else 0.0
-```
+TARGET_DIST = 20.0  # 目标保持距离 200m（武器舒适区）
 
-### 4.4 初始状态（initialize.py — 当前版本）
+damage_reward:        (damage_dealt * 2.0) - (damage_taken * 1.5)
+distance_hold_reward: 2.0 / (1.0 + dist_error * 0.2)  # 保持 ~200m，替代 approach_reward
+heading_reward:       heading_dot * 2.0 (if dist > 30), heading_dot * 0.5 (if dist <= 30)
+proximity_reward:     <30 单位(300m)=0.5, <50 单位(500m)=0.2, else 0.0
+speed_reward:         峰值 0.3 at 5-20 单位(50-200m/s), 范围外负值（鼓励低速盘旋）
+step_penalty:         -0.02
+altitude_penalty:     -10.0 if z < 50 else 0.0
+```
+**关键设计**：distance_hold_reward 替代 approach_reward，引导 agent 保持 200m 距离盘旋缠斗，而非一次性接近冲过。
+
+### 4.4 初始状态（initialize.py — 当前版本，Simple 移动靶）
 ```python
-my:    pos=(0,0,1000), forward_vel=50    # 500m/s
-enemy: pos=(200,0,1000), vel=0          # 初始相距 2000m，固定靶
+my:    pos=(0,0,1000), forward_vel=5    # 50m/s，足够慢可盘旋缠斗
+enemy: pos=(20,0,1000), vel=(5,3,0)     # 初始相距 200m，前50m/s + 侧30m/s 移动靶
 ```
 
 ### 4.5 PPO 超参（main.py — 当前版本）
 ```python
 n_steps=512, batch_size=128, n_epochs=10
-total_timesteps=20000  # ~11分钟
+total_timesteps=50000  # ~30分钟
 learning_rate=1e-4, gamma=0.99, gae_lambda=0.95
 clip_range=0.2, ent_coef=0.005, vf_coef=0.5
 max_grad_norm=0.5, target_kl=0.02
@@ -123,57 +130,85 @@ device=cpu, seed=42
 
 | 运行 | 步数 | 初始距离 | 初速度 | 最高 ep_rew | damage | 结论 |
 |------|------|---------|--------|------------|--------|------|
-| Run 1 | 100K | 3000 | 200 | -132 | 未知 | 收敛但模型未保存 |
-| Run 2 | 100K | 3000 | 200 | -12,500 | 未知 | 发散 |
-| Run 3 | 50K | 3000 | 200 | ~884→-68 | 0 | 太远(30km)，飞不到 |
-| Run 4 | 50K | 500 | 200 | ~-3400 | 0 | 速度太快(2000m/s)，一帧冲过 |
-| Run 5 | 20K | 200 | 50 | ~-3000 | 稀疏(3/40) | 接近敌机但伤害极稀疏 |
+| Run 1-5 | 20-100K | 200-3000 | 50-200 | <0 | 0~稀疏 | 远距+高速→飞过敌机 |
+| | | | | | | |
+| **Phase 1: 参数调优** | | | | | | |
+| Run 8 | 20K | 20(200m) | 5(50m/s) | ~600 | 首次触发 | 距离+速度降低→伤害出现 |
+| Run 10 | 50K | 20(200m) | 5(50m/s) | ~1200 | 持续 | 逐步学习接近，但不稳定 |
+| | | | | | | |
+| **Phase 2: 奖励重设计** | | | | | | |
+| Run 11 | 20K | 20(200m) | 5(50m/s) | 1625 | ~16/步 | distance_hold_reward 突破，agent 学会盘旋 |
+| **Run 12** | **50K** | **20(200m)** | **5(50m/s)** | **1663** | **~16.4/步** | **✅ 成功：2.8s 击杀，持续盘旋近距** |
 
-**Run 5 亮点**：iter 19 出现 `approach=1.44, heading=0.805`，证明 agent 有能力学会接近，但立刻冲过敌机。伤害仅在 3/40 个 iteration 中非零。
+### 5.1 Run 12 详细结果（最终成功运行）
 
-| 诊断 | 日期 | 方法 | 结论 |
-|------|------|------|------|
-| 武器伤害验证 | 2026-06-08 | init_dist=3(30m), vel=0.5, 零操作, 单连接 | **武器系统有效**：每步固定 10 HP 伤害，100 步击杀 |
-| 武器范围测量 | 2026-06-08 | 单连接二分搜索, 距离 1~300 单位 | 攻击范围远超 200m（300 单位=3000m 仍触发伤害），无角度/横向偏移限制 |
-| 矛盾数据分析 | 2026-06-08 | 多连接 vs 单连接对比 | 频繁断连重连（每个距离测一次）导致 TCP 连接污染，InitData 部分失效——不是武器问题，是诊断方法问题 |
-| 训练真实根因 | 2026-06-08 | 综合分析 | 武器有效、射程足够。问题 100% 在 RL 策略层：初始距离太远(2000m)+ 速度太快(500m/s)→ 冲过窗口，无盘旋机制。
+| 指标 | 最终值 | 说明 |
+|------|--------|------|
+| episode_reward | 1663 | 持续上升未衰退 |
+| ep_len_mean | 172 步 | ~2.8 秒完成击杀（1000HP / 16.4HP/步 ≈ 61 步理论值） |
+| damage_per_step | 16.37 HP | 稳定高伤害，武器持续触发 |
+| proximity | 0.5 (饱和) | 始终保持在 300m 内 |
+| distance 分量 | ~152 | distance_hold_reward 引导盘旋 |
+| heading 分量 | ~72 | 机头持续指向敌机 |
 
-## 6. 核心问题（已确认，待修复）
+### 5.2 收敛模式（三阶段学习）
 
-### 6.1 武器系统已验证正常
-武器自动开火，控制协议无显式开火字段。诊断确认：**攻击范围远超 200m（3000m 仍触发），固定 10 HP/步伤害，无角度/偏移限制。** 武器不是问题。
+```
+Phase 1  (0-15K):   探索期 — random exploration, 偶尔触发伤害
+Phase 2  (15K-35K): 学习盘旋 — distance_hold_reward 引导 agent 学会减速保持距离
+Phase 3  (35K-50K): 高效击杀 — damage/speed/heading 完美平衡，伤害饱和
+```
 
-### 6.2 无盘旋/缠斗引导（ROOT CAUSE）
-heading 和 approach 奖励引导 agent 接近敌机，但 agent 接近后立即冲过 —— 没有机制让它**减速盘旋**或**反复进入射程**。
+### 5.3 诊断确认
 
-### 6.3 初始距离和速度不匹配
-初始距离 200 单位（2000m）、初速度 50（500m/s）。agent ~4 步飞过敌机，来不及做出有意义机动。武器射程虽远超 200m，但 agent 缺乏"停留"动机。
+| 诊断 | 结论 |
+|------|------|
+| 武器伤害验证 | 武器系统有效：每步固定 10 HP 伤害，攻击范围远超 200m |
+| 问题根因 | **100% RL 策略层**：初始距离 + 速度 + reward 设计 |
+| GPU 加速 | 不实用 — TCP 瓶颈(~15ms/步) 主导，小 MLP 计算开销可忽略 |
 
-### 6.4 时间尺度过短
-1 步 = 1/60s，512 步 ≈ 8.5 秒。agent 飞过敌机后没有足够时间掉头再次尝试。
 
-## 7. 建议方案（按优先级，已更新）
 
-### 7.1 降低初始距离 + 速度（最优先）
-- initialize.py：初始距离 200 → **20**（200m，出生即在武器射程内）
-- initialize.py：初速度 50 → **10**（100m/s，足够慢以留在射程内）
-- 目的：让 agent 从第一帧就触发 damage reward，不再需要"发现"伤害
+## 6. 核心问题（Phase 4 之前，已解决 ✅）
 
-### 7.2 近距奖励（proximity reward）
-在 reward.py 中添加 proximity_reward（距离 < X 时持续给正奖励），引导 agent 盘旋而非冲过。
+### 6.1 武器系统 — 已确认正常
+武器自动开火，攻击范围远超 200m，固定伤害 per step。武器不是瓶颈。
 
-### 7.3 速度引导调整
-speed_reward 改为奖励低速（目标 10-20 而非 50-100），让 agent 学会减速盘旋。
+### 6.2 盘旋/缠斗引导 — 已解决
+distance_hold_reward 替代 approach_reward，引导 agent 保持 ~200m 距离盘旋。heading_reward 近距离弱化，防止"冲过"行为。
 
-### 7.4 增加 episode 长度
-n_steps：512 → 1024，给 agent 更多时间完成击杀或掉头。
+### 6.3 初始距离和速度 — 已优化
+初始距离 20 单位（200m），初速度 5 单位（50m/s）。agent 从第一帧就进入武器射程。
 
-### 7.5 课程学习（备选）
-Stage 1: 仅 heading + approach + proximity + damage；Stage 2: 增加距离，完整 reward。
+### 6.4 速度引导 — 已调整
+speed_reward 峰值在 5-20 单位（50-200m/s），鼓励低速盘旋缠斗。
+
+## 7. 当前阶段：移动靶（Simple）
+
+### 7.1 目标
+将敌方从 Fixed Target 升级为 Simple 移动靶（无重力，有速度衰减），训练真正空战缠斗。
+
+### 7.2 已完成的改动
+- `initialize.py`: 敌方初速度从 `[0,0,0]` → `[5,3,0]`（前50m/s + 侧30m/s）
+- `diagnose_simple_vs_simple.py`: 双 TCP 连接诊断脚本
+
+### 7.3 当前阻塞
+Simple vs Simple 需要两路 TCP 连接（双方都需要控制器）。诊断脚本 v2 已就绪（InitData + CtrlData 同步发送），待 UE5 房间测试。
+
+### 7.4 下一步
+```bash
+# 1. UE5 创建 Simple vs Simple 房间（端口 1000）
+# 2. 运行双连接诊断验证协议
+cd "D:\study\无人系统设计\2026课程大作业\Python"
+D:/Anaconda/envs/uav_rl/python.exe diagnose_simple_vs_simple.py
+# 3. 诊断通过后 → 改造 train_env.py 支持双连接
+# 4. 50K 重新训练
+# 5. evaluate.py 评估移动靶表现
+```
 
 ## 8. 未来阶段
 
-- **Phase 5**：模型评估 —— 加载模型，仿真运行，分析 episode reward、伤害量、击杀率
+- **Phase 5**：移动靶训练 — **进行中**（双连接协议待验证）
 - **Phase 6**：在线部署 —— 导出模型用于实时对战，测试泛化
 
 ## 9. 运行信息
@@ -183,20 +218,32 @@ Stage 1: 仅 heading + approach + proximity + damage；Stage 2: 增加距离，�
 | Python 环境 | `D:/Anaconda/envs/uav_rl/python.exe` (conda: uav_rl) |
 | 关键依赖 | stable-baselines3==2.7.1, gymnasium==1.1.1, numpy, PyTorch, pyyaml |
 | Docker | battle_server 端口 8887（管理）, 1000-2000（战斗） |
-| UE5 | StudentClient, Fixed 靶机场景 |
+| UE5 | StudentClient, Simple/Fixed 靶机场景 |
 | 工作目录 | `D:\study\无人系统设计\2026课程大作业\Python\` |
 | 训练输出 | `./output/run_N/`（model/, logs/） |
 
 ## 10. 启动流程
 
+### 10.1 Fixed Target 训练/评估（Phase 4 已完成）
 1. 确保 Docker battle_server 运行中
-2. UE5 StudentClient 创建房间（端口 1000, Fixed 靶机）
-3. 执行训练：
+2. UE5 StudentClient 创建房间（端口 1000, Simple vs **Fixed Target**）
+3. 训练：
 ```bash
 cd "D:\study\无人系统设计\2026课程大作业\Python"
 D:/Anaconda/envs/uav_rl/python.exe main.py
 ```
-4. 输出：`./output/run_N/` → `model/`（检查点）, `logs/`（TensorBoard + reward_components.csv）
+4. 评估：
+```bash
+D:/Anaconda/envs/uav_rl/python.exe evaluate.py
+```
+
+### 10.2 Simple vs Simple 诊断（Phase 5 进行中）
+1. UE5 创建房间（端口 1000, **Simple vs Simple**）
+2. 双连接诊断：
+```bash
+D:/Anaconda/envs/uav_rl/python.exe diagnose_simple_vs_simple.py
+```
+3. 输出：`./output/run_N/` → `model/`（检查点）, `logs/`（TensorBoard + reward_components.csv）
 
 ## 11. 关键注意事项
 

@@ -64,7 +64,7 @@ def main():
     )
     model.set_logger(logger)
     model.learn(
-        total_timesteps=20000,
+        total_timesteps=50000,
         progress_bar=True,
         reset_num_timesteps=False,
         log_interval=1,
