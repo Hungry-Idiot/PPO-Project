@@ -3,7 +3,7 @@ import numpy as np
 
 # 距离单位为 10m
 # 30 表示约 300m
-TARGET_DIST = 30.0
+TARGET_DIST = 40.0
 
 # Junior 初始高度
 TARGET_ALTITUDE = 1000.0
@@ -41,12 +41,12 @@ def reward_components(prev_my_state, prev_enemy_state, my_state, enemy_state):
     # 伤害仍然是最主要正反馈。
     damage_dealt = max(0.0, (prev_enemy_state[12] - enemy_state[12]) * 1000.0)
     damage_taken = max(0.0, (prev_my_state[12] - my_state[12]) * 1000.0)
-    comps["damage_reward"] = damage_dealt * 4.0 - damage_taken * 1.2
+    comps["damage_reward"] = damage_dealt * 4.0 - damage_taken * 3.0
 
     # 2. distance hold reward
     # 鼓励接近武器有效距离，但不要求贴脸。
     dist_error = abs(curr_dist - TARGET_DIST)
-    comps["distance_hold_reward"] = 2.0 / (1.0 + dist_error * 0.15)
+    comps["distance_hold_reward"] = 4.0 / (1.0 + dist_error * 0.12)
 
     # 3. heading reward
     # 鼓励机头指向敌机。
@@ -54,18 +54,32 @@ def reward_components(prev_my_state, prev_enemy_state, my_state, enemy_state):
         rel_dir = rel_pos / curr_dist
         forward = _forward_vector_from_state(my_state)
         heading_dot = float(np.dot(forward, rel_dir))
-        comps["heading_reward"] = heading_dot * 2.0
+        comps["heading_reward"] = heading_dot * 4.0
     else:
         comps["heading_reward"] = 0.0
 
     # 4. proximity penalty
     # Junior 阶段仍然避免贴脸碰撞。
-    if curr_dist < 5.0:
-        comps["proximity_reward"] = -10.0
-    elif curr_dist < 10.0:
-        comps["proximity_reward"] = -2.0
+    if curr_dist < 8.0:
+        comps["proximity_reward"] = -40.0
+    elif curr_dist < 15.0:
+        comps["proximity_reward"] = -15.0
+    elif curr_dist < 25.0:
+        comps["proximity_reward"] = -4.0
     else:
         comps["proximity_reward"] = 0.0
+
+    prev_dist = float(
+        np.linalg.norm(
+            np.array(prev_enemy_state[0:3], dtype=np.float64)
+            - np.array(prev_my_state[0:3], dtype=np.float64)
+        )
+    )
+
+    if curr_dist < TARGET_DIST and curr_dist < prev_dist:
+        comps["closing_too_close_penalty"] = -2.0
+    else:
+        comps["closing_too_close_penalty"] = 0.0
 
     # 5. desertion penalty
     # 防止飞远。比 Simple 稍微放宽一点，但仍然强约束。
