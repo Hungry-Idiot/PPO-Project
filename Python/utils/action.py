@@ -13,8 +13,12 @@ def marshal_action(action):
     
     # 3. 核心映射：将油门 (索引 0) 从神经网络的 [-1, 1] 线性映射到物理引擎的 [0, 1]
     # 公式: (x + 1) / 2
-    processed_action[0] = (clipped_action[0] + 1.0) / 2.0
-    
+    raw_throttle = (clipped_action[0] + 1.0) / 2.0
+
+    # Simple moving target 阶段不需要满油门。
+    # 限制最大油门，减少高速冲出战场。
+    processed_action[0] = 0.4 * raw_throttle
+
     # 索引 1, 2, 3 分别是俯仰、滚转、偏航，因为它们本身就需要是 [-1, 1]，所以直接透传即可
     
     return processed_action

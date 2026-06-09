@@ -12,7 +12,7 @@ from stable_baselines3 import PPO
 from utils import adaptor, observation, action, initialize
 
 # ==========================================
-MODEL_PATH = "./output/run_5/model/model_50000_steps.zip"
+MODEL_PATH = "./output/best_simple_model.zip"
 CONFIG_PATH = "./config/envs.yaml"
 # ==========================================
 
