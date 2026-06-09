@@ -1,0 +1,118 @@
+# Junior 阶段专用配置
+# 用于 diagnose_junior_dynamics.py
+# 不要覆盖 Simple 阶段的 envs.yaml
+
+host: 127.0.0.1
+port: 1000
+
+logger: true
+save_path: "../logs/junior_training/"
+
+room:
+  room_id: 114514
+  my_unit_id: 1919810
+  enemy_unit_id: 1919811
+
+  # Junior vs Fixed Target 一般只需要一个 TCP 控制端口。
+  # 如果你创建的是双 TCP 控制房间，再用命令行参数 --dual-port。
+  dual_port: false
+  enemy_port_offset: 1
+
+diagnostics:
+  timeout_seconds: 10.0
+  max_steps_per_case: 300
+  print_every: 10
+  csv_path: "./output/junior_diagnostics/junior_dynamics_{case}_{timestamp}.csv"
+
+initial_state:
+  my:
+    # 注意：距离单位是 10m；z=1000 表示约 10000m
+    pos: [0.0, 0.0, 1000.0]
+    rot: [0.0, 0.0, 0.0]
+    vel: [10.0, 0.0, 0.0]
+    ang_vel: [0.0, 0.0, 0.0]
+
+  enemy:
+    # 动力学诊断阶段先把敌机放远，避免自动武器伤害干扰判断
+    pos: [500.0, 0.0, 1000.0]
+    rot: [0.0, 0.0, 0.0]
+    vel: [0.0, 0.0, 0.0]
+    ang_vel: [0.0, 0.0, 0.0]
+
+test_cases:
+  - name: zero_action
+    throttle: 0.0
+    pitch: 0.0
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_4
+    throttle: 0.4
+    pitch: 0.0
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_5
+    throttle: 0.5
+    pitch: 0.0
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_6
+    throttle: 0.6
+    pitch: 0.0
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_7
+    throttle: 0.7
+    pitch: 0.0
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_8
+    throttle: 0.8
+    pitch: 0.0
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_1_0
+    throttle: 1.0
+    pitch: 0.0
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_6_pitch_pos_0_05
+    throttle: 0.6
+    pitch: 0.05
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_6_pitch_neg_0_05
+    throttle: 0.6
+    pitch: -0.05
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_8_pitch_pos_0_05
+    throttle: 0.8
+    pitch: 0.05
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
+
+  - name: throttle_0_8_pitch_neg_0_05
+    throttle: 0.8
+    pitch: -0.05
+    roll: 0.0
+    yaw: 0.0
+    steps: 300
