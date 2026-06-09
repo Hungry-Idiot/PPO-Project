@@ -41,16 +41,18 @@ def main():
     # Connect both
     sock_a = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock_a.connect((config['host'], config['port']))
+    
     sock_b = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock_b.connect((config['host'], config['port']))
-    print("[OK] Both connected")
+    # 靶机连接到 port + 1 (即 1001 端口)
+    sock_b.connect((config['host'], config['port'] + 1)) 
+    print("[OK] Both connected (Ports 1000 and 1001)")
 
     # Send InitData for both
     init_a = np.array([114514, 1919810], dtype=np.int32)
     init_a = np.append(init_a, np.append(my_init, enemy_init).astype(np.int32))
     sock_a.send(struct.pack(INITIAL_FMT, *init_a))
 
-    init_b = np.array([114514, 1919810], dtype=np.int32)
+    init_b = np.array([114514, 1919811], dtype=np.int32) 
     init_b = np.append(init_b, np.append(enemy_init, my_init).astype(np.int32))
     sock_b.send(struct.pack(INITIAL_FMT, *init_b))
     print("[OK] Both InitData sent")

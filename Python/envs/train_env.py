@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import gymnasium
 from gymnasium import spaces
 from gymnasium.utils import env_checker
@@ -15,13 +19,18 @@ def float_to_bool(f):
         return None
 
 
-def pack_initial(initial_observation):
-    integer_observation = initial_observation.astype(np.int32)
+def pack_initial(my_init, enemy_init, unit_id):
+    # 转换为整数格式
+    integer_my = my_init.astype(np.int32)
+    integer_enemy = enemy_init.astype(np.int32)
+    
     room = 114514
-    unit = 1919810
-    initial_packet = np.array([room], dtype=np.int32)
-    initial_packet = np.append(initial_packet, unit)
-    initial_packet = np.append(initial_packet, integer_observation)
+    initial_packet = np.array([room, unit_id], dtype=np.int32)
+    
+    # 依次拼接视角本体数据和对手数据
+    initial_packet = np.append(initial_packet, integer_my)
+    initial_packet = np.append(initial_packet, integer_enemy)
+    
     return initial_packet
 
 
@@ -58,6 +67,10 @@ class TrainEnv(gymnasium.Env):
         self.adaptor = adaptor.NetworkAdaptor(config_path)
         self.adaptor.connect()
 
+        self.adaptor_enemy = adaptor.NetworkAdaptor(config_path)
+        self.adaptor_enemy.port += 1  # 强制顺延到 1001 端口
+        self.adaptor_enemy.connect()
+
         self.my_state, self.enemy_state = None, None
         self.state = None
         with open(config_path, 'r') as f:
@@ -70,24 +83,30 @@ class TrainEnv(gymnasium.Env):
         truncated = truncate.check_truncation(self.my_state, self.enemy_state)
 
         # Marshal agent actions into real actions and send
-        # First marshal unified actions into platform actions
         real_action = action.marshal_action(agent_action)
-        # Then append truncation flag to the packet and send
         send_pack = pack_action(real_action, truncated)
+        
+        # 构造敌方的零动作并发送
+        enemy_action = np.zeros(4, dtype=np.float64)
+        enemy_send_pack = pack_action(enemy_action, truncated)
+
+        # 双路发送 CtrlData
         self.adaptor.send_action_packet(send_pack)
+        self.adaptor_enemy.send_action_packet(enemy_send_pack)
 
         # Save previous state for reward calculation
         prev_my_state = self.my_state.copy()
         prev_enemy_state = self.enemy_state.copy()
 
-        # Get new observations and unmarshal
+        # 双路接收 BattleData (防止阻塞)
         original_observation = self.adaptor.get_observation_packet()
+        _ = self.adaptor_enemy.get_observation_packet()
+
         self.my_state, self.enemy_state, terminated = split_observation(original_observation)
         # Process whole state into agent state
         self.state = observation.marshal_observation(self.my_state, self.enemy_state)
 
         # Check for termination
-        # But truncation has a higher priority
         if truncated:
             terminated = False
 
@@ -103,13 +122,26 @@ class TrainEnv(gymnasium.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.adaptor.reconnect()
-        new_initial_packet = pack_initial(initialize.generate_initial_state())
-        self.adaptor.send_initial_packet(new_initial_packet)
-        # Get new observations and unmarshal
+
+        # 生成初始状态并拆分
+        init_state = initialize.generate_initial_state()
+        my_init = init_state[0:12]
+        enemy_init = init_state[12:24]
+
+        # 分别打包 (注意敌方视角的 my_init 和 enemy_init 是反过来的)
+        pack_my = pack_initial(my_init, enemy_init, 1919810)
+        pack_enemy = pack_initial(enemy_init, my_init, 1919811)
+
+        # 双路发送 InitData
+        self.adaptor.send_initial_packet(pack_my)
+        self.adaptor_enemy.send_initial_packet(pack_enemy)
+
+        # 必须双路接收 BattleData (敌方视角的数据我们不用，但必须接收以清空 TCP 缓冲区)
         original_observation = self.adaptor.get_observation_packet()
+        _ = self.adaptor_enemy.get_observation_packet() 
+
+        # 仅使用己方视角的数据进行智能体状态处理
         self.my_state, self.enemy_state, termination = split_observation(original_observation)
-        # Process whole state into agent state
         self.state = observation.marshal_observation(self.my_state, self.enemy_state)
         return self.state, {}
 

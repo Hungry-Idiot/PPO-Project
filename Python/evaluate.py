@@ -3,31 +3,54 @@ Evaluate trained PPO model — deterministic inference against battle_server.
 Watch UE5 for visual confirmation of loitering/killing behavior.
 """
 import sys
-sys.path.insert(0, './envs')
-sys.path.insert(0, './utils')
+import os
+# 保证能找到 utils
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from stable_baselines3 import PPO
 from utils import adaptor, observation, action, initialize
 
-MODEL_PATH = "./output/run_12/model/ppo_single_uav.zip"
+# ==========================================
+MODEL_PATH = "./output/run_5/model/model_50000_steps.zip"
 CONFIG_PATH = "./config/envs.yaml"
-
+# ==========================================
 
 def main():
     model = PPO.load(MODEL_PATH)
 
-    net = adaptor.NetworkAdaptor(CONFIG_PATH)
-    net.connect()
+    # 1. 初始化双路连接
+    net_my = adaptor.NetworkAdaptor(CONFIG_PATH)
+    net_my.connect()
 
+    net_enemy = adaptor.NetworkAdaptor(CONFIG_PATH)
+    net_enemy.port += 1 # 连接到靶机的 1001 端口
+    net_enemy.connect()
+
+    # 2. 发送双路初始化包
     init_state = initialize.generate_initial_state()
-    init_packet = np.array([114514, 1919810], dtype=np.int32)
-    init_packet = np.append(init_packet, init_state.astype(np.int32))
-    net.send_initial_packet(init_packet)
+    my_init = init_state[0:12].astype(np.int32)
+    enemy_init = init_state[12:24].astype(np.int32)
 
-    raw = net.get_observation_packet()
-    my_state = raw[0:13].astype(np.float64)
-    enemy_state = raw[13:26].astype(np.float64)
+    # 我方视角打包
+    init_packet_my = np.array([114514, 1919810], dtype=np.int32)
+    init_packet_my = np.append(init_packet_my, my_init)
+    init_packet_my = np.append(init_packet_my, enemy_init)
+
+    # 敌方(靶机)视角打包 (数据要对调)
+    init_packet_enemy = np.array([114514, 1919811], dtype=np.int32)
+    init_packet_enemy = np.append(init_packet_enemy, enemy_init)
+    init_packet_enemy = np.append(init_packet_enemy, my_init)
+
+    net_my.send_initial_packet(init_packet_my)
+    net_enemy.send_initial_packet(init_packet_enemy)
+
+    # 3. 双路接收初始观测值
+    raw_my = net_my.get_observation_packet()
+    _ = net_enemy.get_observation_packet()
+
+    my_state = raw_my[0:13].astype(np.float64)
+    enemy_state = raw_my[13:26].astype(np.float64)
     obs = observation.marshal_observation(my_state, enemy_state)
 
     total_damage = 0.0
@@ -39,16 +62,27 @@ def main():
     print("-" * len(header))
 
     for step in range(1000):
+        # 智能体决策
         agent_action, _ = model.predict(obs, deterministic=True)
         real_action = action.marshal_action(agent_action)
         send_pack = np.append(real_action, 0.0)
-        net.send_action_packet(send_pack)
+        
+        # 靶机决策 (全零无操作滑行)
+        enemy_action = np.zeros(4, dtype=np.float64)
+        enemy_send_pack = np.append(enemy_action, 0.0)
 
-        raw = net.get_observation_packet()
+        # 双路发送控制指令
+        net_my.send_action_packet(send_pack)
+        net_enemy.send_action_packet(enemy_send_pack)
+
+        # 双路接收战斗数据
+        raw_my = net_my.get_observation_packet()
+        _ = net_enemy.get_observation_packet()
+
         prev_enemy_hp = enemy_state[12]
-        my_state = raw[0:13].astype(np.float64)
-        enemy_state = raw[13:26].astype(np.float64)
-        is_done = raw[26]
+        my_state = raw_my[0:13].astype(np.float64)
+        enemy_state = raw_my[13:26].astype(np.float64)
+        is_done = raw_my[26]
 
         obs = observation.marshal_observation(my_state, enemy_state)
 
@@ -79,8 +113,8 @@ def main():
     print(f"  KILL:        {'YES' if killed else 'NO'}")
     print(f"{'='*50}")
 
-    net.socket.close()
-
+    net_my.socket.close()
+    net_enemy.socket.close()
 
 if __name__ == "__main__":
     main()

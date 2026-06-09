@@ -68,7 +68,6 @@ Python/
 ├── diagnose_env.py      # 环境连通性诊断
 ├── diagnose_combat.py   # 交战距离诊断（PID 导引）
 ├── diagnose_damage_short.py  # 武器伤害验证（超近距离 + 零操作）
-├── diagnose_damage_short.py  # 武器伤害验证（超近距离 + 零操作）
 ├── diagnose_weapon_range.py  # 武器攻击范围测量（单连接二分搜索）
 └── diagnose_simple_vs_simple.py  # Simple vs Simple 双连接诊断
 ```
@@ -95,19 +94,21 @@ action = [throttle, pitch, roll, yaw]  # 全部 ∈ [-1, 1]
 # pitch/roll/yaw: 直接透传
 ```
 
-### 4.3 奖励函数（reward.py — 当前版本，Run 12 验证成功）
+### 4.3 奖励函数（reward.py — 当前版本，移动靶优化）
 ```python
-TARGET_DIST = 20.0  # 目标保持距离 200m（武器舒适区）
+TARGET_DIST = 20.0  # 目标保持距离 200m
 
-damage_reward:        (damage_dealt * 2.0) - (damage_taken * 1.5)
-distance_hold_reward: 2.0 / (1.0 + dist_error * 0.2)  # 保持 ~200m，替代 approach_reward
-heading_reward:       heading_dot * 2.0 (if dist > 30), heading_dot * 0.5 (if dist <= 30)
-proximity_reward:     <30 单位(300m)=0.5, <50 单位(500m)=0.2, else 0.0
-speed_reward:         峰值 0.3 at 5-20 单位(50-200m/s), 范围外负值（鼓励低速盘旋）
-step_penalty:         -0.02
-altitude_penalty:     -10.0 if z < 50 else 0.0
+# 9 个分量，面向移动靶追瞄作战：
+damage_reward:         (damage_dealt * 2.0) - (damage_taken * 1.5)
+distance_hold_reward:  2.0 / (1.0 + dist_error * 0.2)   # 保持 ~200m 最佳射程
+heading_reward:        heading_dot * 2.0                  # 永远鼓励机头对敌（取消近距离弱化）
+proximity_reward:      <4(=40m)=-20, <7(=70m)=-5, else 0 # 仅惩罚贴脸防撞
+desertion_penalty:     >150(1500m)=-1000, >50(500m)=-10  # 逃脱判负，严禁飞离战场
+speed_reward:          5-9(50-90m/s)=1.0, >9=-2, >12=-10 # 追瞄转弯速度 50-90m/s
+step_penalty:          -0.02
+altitude_penalty:      <30=-20, <50=-5, else 0           # 允许有限俯冲攻击
+death_penalty:         -1000 if HP ≤ 0                    # 一票否决自杀流
 ```
-**关键设计**：distance_hold_reward 替代 approach_reward，引导 agent 保持 200m 距离盘旋缠斗，而非一次性接近冲过。
 
 ### 4.4 初始状态（initialize.py — 当前版本，Simple 移动靶）
 ```python
@@ -190,25 +191,26 @@ speed_reward 峰值在 5-20 单位（50-200m/s），鼓励低速盘旋缠斗。
 
 ### 7.2 已完成的改动
 - `initialize.py`: 敌方初速度从 `[0,0,0]` → `[5,3,0]`（前50m/s + 侧30m/s）
-- `diagnose_simple_vs_simple.py`: 双 TCP 连接诊断脚本
+- `diagnose_simple_vs_simple.py`: 双连接诊断脚本（己方 `port`，敌方 `port+1`，双端口模式）
+- `reward.py`: 全面重写面向移动靶 — heading 永不衰减、desertion_penalty 防逃脱、speed 收窄到 50-90m/s
 
-### 7.3 当前阻塞
-Simple vs Simple 需要两路 TCP 连接（双方都需要控制器）。诊断脚本 v2 已就绪（InitData + CtrlData 同步发送），待 UE5 房间测试。
+### 7.3 关键发现：双端口协议
+Simple vs Simple 服务器为双方分配不同端口：己方连接 `config['port']` (1000)，敌方连接 `port + 1` (1001)。每个客户端需独立的 TCP 连接和 InitData (不同 unit ID)。
 
 ### 7.4 下一步
 ```bash
 # 1. UE5 创建 Simple vs Simple 房间（端口 1000）
-# 2. 运行双连接诊断验证协议
+# 2. 运行双端口诊断验证协议
 cd "D:\study\无人系统设计\2026课程大作业\Python"
 D:/Anaconda/envs/uav_rl/python.exe diagnose_simple_vs_simple.py
-# 3. 诊断通过后 → 改造 train_env.py 支持双连接
-# 4. 50K 重新训练
+# 3. 诊断通过后 → 改造 train_env.py 支持双连接训练
+# 4. 移动靶 reward 测试训练
 # 5. evaluate.py 评估移动靶表现
 ```
 
 ## 8. 未来阶段
 
-- **Phase 5**：移动靶训练 — **进行中**（双连接协议待验证）
+- **Phase 5**：移动靶训练 — **进行中**（双端口协议已验证，train_env 改造待完成）
 - **Phase 6**：在线部署 —— 导出模型用于实时对战，测试泛化
 
 ## 9. 运行信息
@@ -217,7 +219,7 @@ D:/Anaconda/envs/uav_rl/python.exe diagnose_simple_vs_simple.py
 |------|-----|
 | Python 环境 | `D:/Anaconda/envs/uav_rl/python.exe` (conda: uav_rl) |
 | 关键依赖 | stable-baselines3==2.7.1, gymnasium==1.1.1, numpy, PyTorch, pyyaml |
-| Docker | battle_server 端口 8887（管理）, 1000-2000（战斗） |
+| Docker | battle_server 端口 8887（管理）, 1000-2000（战斗，Simple vs Simple 用 1000+1001） |
 | UE5 | StudentClient, Simple/Fixed 靶机场景 |
 | 工作目录 | `D:\study\无人系统设计\2026课程大作业\Python\` |
 | 训练输出 | `./output/run_N/`（model/, logs/） |
@@ -237,13 +239,12 @@ D:/Anaconda/envs/uav_rl/python.exe main.py
 D:/Anaconda/envs/uav_rl/python.exe evaluate.py
 ```
 
-### 10.2 Simple vs Simple 诊断（Phase 5 进行中）
+### 10.2 Simple vs Simple 诊断（Phase 5 进行中，双端口）
 1. UE5 创建房间（端口 1000, **Simple vs Simple**）
-2. 双连接诊断：
+2. 双端口诊断（己方 1000, 敌方 1001）：
 ```bash
 D:/Anaconda/envs/uav_rl/python.exe diagnose_simple_vs_simple.py
 ```
-3. 输出：`./output/run_N/` → `model/`（检查点）, `logs/`（TensorBoard + reward_components.csv）
 
 ## 11. 关键注意事项
 
