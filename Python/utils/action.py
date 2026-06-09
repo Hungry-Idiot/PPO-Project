@@ -1,24 +1,43 @@
 import numpy as np
 
+
+# Junior 第一版动作映射
+# 诊断结果显示：
+# - throttle=0.4 基本平飞
+# - throttle=0.5/0.6 有爬升能力
+# 因此先把物理油门限制到 [0.2, 0.6]：
+# - PPO 输出 -1 -> throttle = 0.2
+# - PPO 输出  0 -> throttle = 0.4
+# - PPO 输出 +1 -> throttle = 0.6
+MIN_THROTTLE = 0.2
+MAX_THROTTLE = 0.6
+
+
 def marshal_action(action):
     """
     处理智能体输出的动作，映射为仿真环境需要的物理控制量。
-    action 数组索引对应: [0]油门, [1]升降舵(俯仰), [2]副翼(滚转), [3]方向舵(偏航)
+
+    PPO 输出:
+        action[0] throttle raw, 范围 [-1, 1]
+        action[1] pitch,        范围 [-1, 1]
+        action[2] roll,         范围 [-1, 1]
+        action[3] yaw,          范围 [-1, 1]
+
+    仿真平台需要:
+        throttle: [0, 1]
+        pitch:    [-1, 1]
+        roll:     [-1, 1]
+        yaw:      [-1, 1]
     """
-    # 1. 裁剪动作，防止神经网络在探索初期输出越界值（例如爆出 -2.5 或 1.8）
-    clipped_action = np.clip(action, -1.0, 1.0)
-    
-    # 2. 拷贝一份用于修改，并确保数据类型为环境所需的 float64
+    clipped_action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+
     processed_action = clipped_action.copy().astype(np.float64)
-    
-    # 3. 核心映射：将油门 (索引 0) 从神经网络的 [-1, 1] 线性映射到物理引擎的 [0, 1]
-    # 公式: (x + 1) / 2
+
     raw_throttle = (clipped_action[0] + 1.0) / 2.0
+    processed_action[0] = MIN_THROTTLE + (MAX_THROTTLE - MIN_THROTTLE) * raw_throttle
 
-    # Simple moving target 阶段不需要满油门。
-    # 限制最大油门，减少高速冲出战场。
-    processed_action[0] = 0.4 * raw_throttle
+    processed_action[1] = clipped_action[1]
+    processed_action[2] = clipped_action[2]
+    processed_action[3] = clipped_action[3]
 
-    # 索引 1, 2, 3 分别是俯仰、滚转、偏航，因为它们本身就需要是 [-1, 1]，所以直接透传即可
-    
     return processed_action

@@ -1,82 +1,140 @@
 import numpy as np
 
-TARGET_DIST = 20.0  # 目标距离 200m，武器舒适射程
+
+# 距离单位为 10m
+# 30 表示约 300m
+TARGET_DIST = 30.0
+
+# Junior 初始高度
+TARGET_ALTITUDE = 1000.0
+
+# Junior 第一版速度目标区间
+# 诊断中 throttle=0.4~0.6 时速度大约进入十几到二十左右的量级，
+# 因此先不要沿用 Simple 的低速偏好。
+IDEAL_SPEED_MIN = 12.0
+IDEAL_SPEED_MAX = 22.0
+
+
+def _forward_vector_from_state(state):
+    """
+    根据 roll, pitch, yaw 计算机头方向。
+    当前只使用 pitch/yaw，和 observation.py / Simple reward 中保持一致。
+    """
+    roll, pitch, yaw = state[3], state[4], state[5]
+
+    forward_x = np.cos(yaw) * np.cos(pitch)
+    forward_y = np.sin(yaw) * np.cos(pitch)
+    forward_z = np.sin(pitch)
+
+    return np.array([forward_x, forward_y, forward_z], dtype=np.float64)
+
 
 def reward_components(prev_my_state, prev_enemy_state, my_state, enemy_state):
     comps = {}
 
-    # 1. damage reward - 伤害是第一生产力
-    damage_dealt = (prev_enemy_state[12] - enemy_state[12]) * 1000.0
-    damage_taken = (prev_my_state[12] - my_state[12]) * 1000.0
-    comps["damage_reward"] = (damage_dealt * 4.0) - (damage_taken * 1.0)
+    my_pos = np.array(my_state[0:3], dtype=np.float64)
+    enemy_pos = np.array(enemy_state[0:3], dtype=np.float64)
+    rel_pos = enemy_pos - my_pos
+    curr_dist = float(np.linalg.norm(rel_pos))
 
-    # 2. distance hold reward - 引导保持在目标距离
-    curr_dist = np.linalg.norm(np.array(enemy_state[0:3]) - np.array(my_state[0:3]))
+    # 1. damage reward
+    # 伤害仍然是最主要正反馈。
+    damage_dealt = max(0.0, (prev_enemy_state[12] - enemy_state[12]) * 1000.0)
+    damage_taken = max(0.0, (prev_my_state[12] - my_state[12]) * 1000.0)
+    comps["damage_reward"] = damage_dealt * 4.0 - damage_taken * 1.2
+
+    # 2. distance hold reward
+    # 鼓励接近武器有效距离，但不要求贴脸。
     dist_error = abs(curr_dist - TARGET_DIST)
-    comps["distance_hold_reward"] = 2.0 / (1.0 + dist_error * 0.2)
+    comps["distance_hold_reward"] = 2.0 / (1.0 + dist_error * 0.15)
 
-    # 3. heading reward - 核心修复：永远鼓励机头对敌！取消靠近后的惩罚
-    rel_pos = np.array(enemy_state[0:3]) - np.array(my_state[0:3])
+    # 3. heading reward
+    # 鼓励机头指向敌机。
     if curr_dist > 1e-6:
         rel_dir = rel_pos / curr_dist
-        roll, pitch, yaw = my_state[3], my_state[4], my_state[5]
-        forward_x = np.cos(yaw) * np.cos(pitch)
-        forward_y = np.sin(yaw) * np.cos(pitch)
-        forward_z = np.sin(pitch)
-        forward = np.array([forward_x, forward_y, forward_z])
-        heading_dot = np.dot(forward, rel_dir)
-        
-        # 只要对准就给大额奖励，鼓励死咬不放
+        forward = _forward_vector_from_state(my_state)
+        heading_dot = float(np.dot(forward, rel_dir))
         comps["heading_reward"] = heading_dot * 2.0
     else:
         comps["heading_reward"] = 0.0
 
-    # 4. proximity penalty - 缩小恐惧圈，只惩罚真正要相撞的贴脸距离
-    if curr_dist < 4.0:
+    # 4. proximity penalty
+    # Junior 阶段仍然避免贴脸碰撞。
+    if curr_dist < 5.0:
         comps["proximity_reward"] = -10.0
-    elif curr_dist < 7.0:
+    elif curr_dist < 10.0:
         comps["proximity_reward"] = -2.0
     else:
         comps["proximity_reward"] = 0.0
 
-    # 5. desertion penalty - 新增逃脱惩罚！严禁打完就跑
-    if curr_dist > 150.0:
-        comps["desertion_penalty"] = -100.0
-    elif curr_dist > 50.0:
+    # 5. desertion penalty
+    # 防止飞远。比 Simple 稍微放宽一点，但仍然强约束。
+    if curr_dist > 200.0:
+        comps["desertion_penalty"] = -120.0
+    elif curr_dist > 100.0:
+        comps["desertion_penalty"] = -8.0
+    elif curr_dist > 60.0:
         comps["desertion_penalty"] = -2.0
     else:
         comps["desertion_penalty"] = 0.0
-        
-    # 6. speed reward - 靶机速度约为 5.8 (58m/s)，鼓励战机保持 50~100m/s 的追击速度
-    speed = np.linalg.norm(my_state[6:9])
-    if speed > 15.0:
-        comps["speed_reward"] = -3.0
-    elif speed > 12.0:
-        comps["speed_reward"] = -1.0
-    elif 3.0 <= speed <= 12.0:
+
+    # 6. speed reward
+    # Junior 不再奖励过低速度；速度太低可能无法维持飞行。
+    speed = float(np.linalg.norm(my_state[6:9]))
+
+    if IDEAL_SPEED_MIN <= speed <= IDEAL_SPEED_MAX:
         comps["speed_reward"] = 1.0
-    else:
+    elif 8.0 <= speed < IDEAL_SPEED_MIN:
         comps["speed_reward"] = -0.5
+    elif speed < 8.0:
+        comps["speed_reward"] = -3.0
+    elif IDEAL_SPEED_MAX < speed <= 32.0:
+        comps["speed_reward"] = 0.2
+    else:
+        comps["speed_reward"] = -3.0
 
-    # 7. step penalty
-    comps["step_penalty"] = -0.02
+    # 7. altitude hold reward / penalty
+    # Junior 受重力影响，高度保持必须明确加入奖励。
+    altitude = float(my_state[2])
+    altitude_error = abs(altitude - TARGET_ALTITUDE)
 
-    # 8. altitude penalty - 稍微降低一点高度惩罚的敏感度，允许俯冲攻击
-    if my_state[2] < 30.0:    
-        comps["altitude_penalty"] = -20.0
-    elif my_state[2] < 50.0:  
+    comps["altitude_hold_reward"] = 1.0 / (1.0 + altitude_error * 0.02)
+
+    if altitude < 600.0:
+        comps["altitude_penalty"] = -150.0
+    elif altitude < 800.0:
+        comps["altitude_penalty"] = -40.0
+    elif altitude < 900.0:
+        comps["altitude_penalty"] = -8.0
+    elif altitude > 1300.0:
         comps["altitude_penalty"] = -5.0
     else:
         comps["altitude_penalty"] = 0.0
 
-    # 9. death penalty - 继续保持一票否决自杀流
+    # 8. vertical speed penalty
+    # my_state[8] 是 z 方向速度。负值过大说明正在快速掉高。
+    vertical_speed = float(my_state[8])
+
+    if vertical_speed < -10.0:
+        comps["vertical_speed_penalty"] = -8.0
+    elif vertical_speed < -5.0:
+        comps["vertical_speed_penalty"] = -3.0
+    else:
+        comps["vertical_speed_penalty"] = 0.0
+
+    # 9. step penalty
+    comps["step_penalty"] = -0.02
+
+    # 10. death penalty
+    # 继续使用 transition-only，避免死亡后重复扣分。
     death_transition = prev_my_state[12] > 0.01 and my_state[12] <= 0.01
 
     if death_transition:
-        comps["death_penalty"] = -1000.0
+        comps["death_penalty"] = -2000.0
     else:
         comps["death_penalty"] = 0.0
 
+    # 11. kill bonus
     kill_transition = prev_enemy_state[12] > 0.01 and enemy_state[12] <= 0.01
 
     if kill_transition:
@@ -85,7 +143,14 @@ def reward_components(prev_my_state, prev_enemy_state, my_state, enemy_state):
         comps["kill_bonus"] = 0.0
 
     comps["total"] = sum(comps.values())
+
     return comps
 
+
 def calculate_reward(prev_my_state, prev_enemy_state, my_state, enemy_state):
-    return reward_components(prev_my_state, prev_enemy_state, my_state, enemy_state)["total"]
+    return reward_components(
+        prev_my_state,
+        prev_enemy_state,
+        my_state,
+        enemy_state
+    )["total"]
