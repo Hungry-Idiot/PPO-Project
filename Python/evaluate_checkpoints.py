@@ -1,435 +1,540 @@
-"""
-Batch evaluate PPO checkpoints in Simple-vs-Simple dual-port mode.
-
-Place this file under:
-    Python/evaluate_checkpoints.py
-
-Run from the Python directory:
-    D:/Anaconda/envs/uav_rl/python.exe evaluate_checkpoints.py --run-dir ./output/run_XX --episodes 10
-
-It will write:
-    ./output/eval_<timestamp>/checkpoint_episode_results.csv
-    ./output/eval_<timestamp>/checkpoint_summary.csv
-"""
-
-from __future__ import annotations
-
 import argparse
 import csv
 import os
 import re
 import time
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from stable_baselines3 import PPO
 
-from utils import adaptor, action, initialize, observation, reward
+from utils import adaptor
+from utils import action
+from utils import initialize
+from utils import observation
+from utils import truncate
 
 
-CONFIG_PATH = "./config/envs.yaml"
+DEFAULT_CONFIG_PATH = "./config/envs.yaml"
+DEFAULT_MODEL_DIR = "./output/simple_fixed_1000m/run_0/model"
+DEFAULT_OUTPUT_CSV = "./output/simple_fixed_1000m/checkpoint_eval_results.csv"
 
 
-def pack_initial(my_init: np.ndarray, enemy_init: np.ndarray, unit_id: int) -> np.ndarray:
-    """Pack InitData payload: [room, unit_id, my_12, enemy_12]."""
-    room = 114514
-    packet = np.array([room, unit_id], dtype=np.int32)
-    packet = np.append(packet, my_init.astype(np.int32))
-    packet = np.append(packet, enemy_init.astype(np.int32))
-    return packet
-
-
-def pack_ctrl(ctrl4: np.ndarray, done: float = 0.0) -> np.ndarray:
-    """Pack CtrlData payload: [throttle, pitch, roll, yaw, done]."""
-    return np.append(ctrl4.astype(np.float64), float(done)).astype(np.float64)
-
-
-def split_battle(raw: np.ndarray):
-    my_state = raw[0:13].astype(np.float64).copy()
-    enemy_state = raw[13:26].astype(np.float64).copy()
-    is_done = bool(raw[26] == 1.0)
-    return my_state, enemy_state, is_done
-
-
-def checkpoint_sort_key(path: Path):
-    """Sort model_5000_steps.zip by step number; final ppo_single_uav.zip goes last."""
-    m = re.search(r"model_(\d+)_steps\.zip$", path.name)
+def parse_step_from_name(path: Path) -> int:
+    """
+    从 model_5000_steps.zip 这种文件名里提取 5000。
+    如果不是 checkpoint 命名，则返回一个很大的数，排在后面。
+    """
+    m = re.search(r"(\d+)_steps", path.name)
     if m:
         return int(m.group(1))
-    if path.name == "ppo_single_uav.zip":
-        return 10**18
-    return 10**17
+    return 10**18
 
 
-def find_checkpoints(run_dir: str | None, explicit_models: list[str] | None) -> list[Path]:
-    if explicit_models:
-        paths = [Path(p) for p in explicit_models]
-    else:
-        if not run_dir:
-            raise ValueError("Either --run-dir or --models must be provided.")
-        model_dir = Path(run_dir) / "model"
-        paths = sorted(model_dir.glob("*.zip"), key=checkpoint_sort_key)
+def find_checkpoints(model_dir: str, selected_steps=None):
+    model_dir = Path(model_dir)
 
-    paths = [p for p in paths if p.exists()]
-    if not paths:
-        raise FileNotFoundError("No checkpoint .zip files found.")
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
 
-    return paths
+    all_models = sorted(
+        model_dir.glob("*.zip"),
+        key=lambda p: parse_step_from_name(p)
+    )
 
+    if selected_steps:
+        selected_steps = set(int(x) for x in selected_steps)
+        return [
+            p for p in all_models
+            if parse_step_from_name(p) in selected_steps
+        ]
 
-def connect_pair(config_path: str):
-    """Create two fresh TCP connections: my port and enemy port+1."""
-    net_my = adaptor.NetworkAdaptor(config_path)
-    net_my.connect()
-
-    net_enemy = adaptor.NetworkAdaptor(config_path)
-    net_enemy.port += 1
-    net_enemy.connect()
-
-    return net_my, net_enemy
+    return all_models
 
 
-def close_pair(net_my, net_enemy):
-    for net in (net_my, net_enemy):
-        try:
-            net.socket.close()
-        except Exception:
-            pass
+def split_observation(original_observation):
+    """
+    BattleData:
+    m_unit_1[13], m_unit_2[13], m_is_done
+    """
+    my_state = np.array(original_observation[0:13], dtype=np.float64)
+    enemy_state = np.array(original_observation[13:26], dtype=np.float64)
+    terminated = bool(original_observation[26] > 0.5)
+    return my_state, enemy_state, terminated
 
 
-def start_episode(net_my, net_enemy):
-    """Send InitData for both sides, then send one CtrlData to trigger first BattleData."""
+def build_initial_packet():
+    """
+    InitData:
+    [room_id, unit_id] + my_init[12] + enemy_init[12]
+    共 26 个 int。
+    """
     init_state = initialize.generate_initial_state()
-    my_init = init_state[0:12]
-    enemy_init = init_state[12:24]
 
-    packet_my = pack_initial(my_init, enemy_init, 1919810)
-    packet_enemy = pack_initial(enemy_init, my_init, 1919811)
+    my_init = init_state[0:12].astype(np.int32)
+    enemy_init = init_state[12:24].astype(np.int32)
 
-    net_my.send_initial_packet(packet_my)
-    net_enemy.send_initial_packet(packet_enemy)
+    initial_distance_units = float(np.linalg.norm(enemy_init[0:3] - my_init[0:3]))
+    initial_distance_m = initial_distance_units * 10.0
 
-    # Simple-vs-Simple needs both clients to send CtrlData before BattleData is produced.
-    zero_ctrl = np.zeros(5, dtype=np.float64)
-    net_my.send_action_packet(zero_ctrl)
-    net_enemy.send_action_packet(zero_ctrl)
+    if initial_distance_m < 1000.0:
+        raise ValueError(
+            f"Initial distance is {initial_distance_m:.1f}m, "
+            f"but it must be >= 1000m."
+        )
 
-    raw_my = net_my.get_observation_packet()
-    _ = net_enemy.get_observation_packet()
+    packet = np.array([114514, 1919810], dtype=np.int32)
+    packet = np.append(packet, my_init)
+    packet = np.append(packet, enemy_init)
 
-    my_state, enemy_state, is_done = split_battle(raw_my)
-    obs = observation.marshal_observation(my_state, enemy_state)
+    return packet, initial_distance_m
 
-    return obs, my_state, enemy_state, is_done
+
+def safe_close(net):
+    try:
+        if getattr(net, "socket", None) is not None:
+            net.socket.close()
+    except Exception:
+        pass
 
 
 def evaluate_one_episode(
-    model: PPO,
-    model_path: Path,
-    episode_idx: int,
-    config_path: str,
-    max_steps: int,
-    sleep_after_connect: float = 0.05,
+    model,
+    model_path,
+    repeat_id,
+    config_path,
+    max_steps,
+    deterministic=True,
+    verbose_every=0,
+    drain_steps=80,
 ):
-    net_my, net_enemy = None, None
+    net = adaptor.NetworkAdaptor(config_path)
+
+    result = {
+        "model": os.path.basename(model_path),
+        "model_path": str(model_path),
+        "checkpoint_step": parse_step_from_name(Path(model_path)),
+        "repeat": repeat_id,
+
+        "initial_distance_m": None,
+        "reset_distance_m": None,
+        "reset_enemy_hp": None,
+        "reset_self_hp": None,
+        "reset_ok": False,
+
+        "steps": 0,
+        "drain_steps": 0,
+        "killed": False,
+        "terminated": False,
+        "truncated": False,
+        "self_dead": False,
+
+        "enemy_hp": None,
+        "self_hp": None,
+        "total_damage_hp": 0.0,
+        "min_distance_m": None,
+        "final_distance_m": None,
+        "final_speed": None,
+
+        "error": "",
+    }
 
     try:
-        net_my, net_enemy = connect_pair(config_path)
-        if sleep_after_connect > 0:
-            time.sleep(sleep_after_connect)
+        net.connect()
 
-        obs, my_state, enemy_state, is_done = start_episode(net_my, net_enemy)
+        init_packet, initial_distance_m = build_initial_packet()
+        result["initial_distance_m"] = initial_distance_m
 
-        total_damage = 0.0
-        total_damage_taken = 0.0
-        total_reward = 0.0
-        max_damage_step = 0.0
-        min_dist_m = float("inf")
-        max_dist_m = 0.0
-        heading_sum = 0.0
-        speed_sum = 0.0
-        desertion_steps = 0
-        proximity_steps = 0
-        damage_steps = 0
-        last_comps = {}
+        net.send_initial_packet(init_packet)
+        raw_obs = net.get_observation_packet()
 
-        killed = False
-        self_dead = False
-        terminated_by_done = False
+        my_state, enemy_state, terminated = split_observation(raw_obs)
+        obs = observation.marshal_observation(my_state, enemy_state)
+
+        reset_dist_units = float(np.linalg.norm(enemy_state[0:3] - my_state[0:3]))
+        reset_distance_m = reset_dist_units * 10.0
+        reset_enemy_hp = float(enemy_state[12])
+        reset_self_hp = float(my_state[12])
+
+        result["reset_distance_m"] = reset_distance_m
+        result["reset_enemy_hp"] = reset_enemy_hp
+        result["reset_self_hp"] = reset_self_hp
+
+        reset_ok = (900.0 <= reset_distance_m <= 1100.0) and (reset_enemy_hp >= 0.99)
+        result["reset_ok"] = reset_ok
+
+        if not reset_ok:
+            print(
+                f"[WARN] First BattleData is not a clean reset: "
+                f"distance={reset_distance_m:.1f}m, "
+                f"enemy_hp={reset_enemy_hp:.3f}, "
+                f"self_hp={reset_self_hp:.3f}. "
+                f"This episode will continue and be marked reset_ok=False."
+            )
+
+        init_enemy_hp = reset_enemy_hp
+        min_dist_units = reset_dist_units
+
+        if verbose_every > 0:
+            print(
+                f"[INIT] {os.path.basename(model_path)} "
+                f"repeat={repeat_id} "
+                f"target_init_dist={initial_distance_m:.1f}m "
+                f"reset_dist={reset_distance_m:.1f}m "
+                f"my_hp={reset_self_hp:.3f} "
+                f"enemy_hp={reset_enemy_hp:.3f} "
+                f"reset_ok={reset_ok}"
+            )
 
         for step in range(1, max_steps + 1):
-            prev_my_state = my_state.copy()
-            prev_enemy_state = enemy_state.copy()
-
-            agent_action, _ = model.predict(obs, deterministic=True)
+            agent_action, _ = model.predict(obs, deterministic=deterministic)
             real_action = action.marshal_action(agent_action)
-            net_my.send_action_packet(pack_ctrl(real_action, 0.0))
 
-            # Match current training setup: enemy is a zero-action moving target.
-            enemy_ctrl = np.zeros(4, dtype=np.float64)
-            net_enemy.send_action_packet(pack_ctrl(enemy_ctrl, 0.0))
+            send_pack = np.append(real_action, 0.0).astype(np.float64)
+            net.send_action_packet(send_pack)
 
-            raw_my = net_my.get_observation_packet()
-            _ = net_enemy.get_observation_packet()
-
-            my_state, enemy_state, is_done = split_battle(raw_my)
+            raw_obs = net.get_observation_packet()
+            my_state, enemy_state, terminated = split_observation(raw_obs)
             obs = observation.marshal_observation(my_state, enemy_state)
 
-            damage = max(0.0, (prev_enemy_state[12] - enemy_state[12]) * 1000.0)
-            damage_taken = max(0.0, (prev_my_state[12] - my_state[12]) * 1000.0)
-            total_damage += damage
-            total_damage_taken += damage_taken
-            max_damage_step = max(max_damage_step, damage)
-            if damage > 0:
-                damage_steps += 1
+            dist_units = float(np.linalg.norm(enemy_state[0:3] - my_state[0:3]))
+            min_dist_units = min(min_dist_units, dist_units)
 
-            comps = reward.reward_components(prev_my_state, prev_enemy_state, my_state, enemy_state)
-            last_comps = comps
-            total_reward += float(comps.get("total", 0.0))
-
-            rel_pos = enemy_state[0:3] - my_state[0:3]
-            dist_units = float(np.linalg.norm(rel_pos))
-            dist_m = dist_units * 10.0
-            min_dist_m = min(min_dist_m, dist_m)
-            max_dist_m = max(max_dist_m, dist_m)
-
+            enemy_hp = float(enemy_state[12])
+            self_hp = float(my_state[12])
+            total_damage_hp = max(0.0, (init_enemy_hp - enemy_hp) * 1000.0)
             speed = float(np.linalg.norm(my_state[6:9]))
-            speed_sum += speed
 
-            if dist_units > 1e-6:
-                roll, pitch, yaw = my_state[3], my_state[4], my_state[5]
-                forward = np.array([
-                    np.cos(yaw) * np.cos(pitch),
-                    np.sin(yaw) * np.cos(pitch),
-                    np.sin(pitch),
-                ])
-                heading_dot = float(np.dot(forward, rel_pos / dist_units))
-            else:
-                heading_dot = 0.0
-            heading_sum += heading_dot
+            local_truncated = truncate.check_truncation(my_state, enemy_state)
+            killed = enemy_hp <= 0.01
+            self_dead = self_hp <= 0.01
 
-            if dist_units > 50.0:
-                desertion_steps += 1
-            if dist_units < 7.0:
-                proximity_steps += 1
+            result["steps"] = step
+            result["enemy_hp"] = enemy_hp
+            result["self_hp"] = self_hp
+            result["total_damage_hp"] = total_damage_hp
+            result["min_distance_m"] = min_dist_units * 10.0
+            result["final_distance_m"] = dist_units * 10.0
+            result["final_speed"] = speed
+            result["killed"] = killed
+            result["terminated"] = terminated
+            result["truncated"] = bool(result["truncated"] or local_truncated)
+            result["self_dead"] = self_dead
 
-            killed = enemy_state[12] <= 0.01
-            self_dead = my_state[12] <= 0.01
-            terminated_by_done = is_done
+            if verbose_every > 0 and (
+                step % verbose_every == 0
+                or killed
+                or terminated
+                or local_truncated
+                or total_damage_hp > 0.0
+            ):
+                print(
+                    f"[STEP {step:04d}] "
+                    f"dist={dist_units * 10.0:8.1f}m "
+                    f"enemy_hp={enemy_hp:.3f} "
+                    f"self_hp={self_hp:.3f} "
+                    f"dmg={total_damage_hp:7.1f} "
+                    f"thr={real_action[0]:+.3f} "
+                    f"pitch={real_action[1]:+.3f} "
+                    f"roll={real_action[2]:+.3f} "
+                    f"yaw={real_action[3]:+.3f} "
+                    f"speed={speed:.2f} "
+                    f"term={terminated} "
+                    f"local_trunc={local_truncated}"
+                )
 
-            if is_done or killed or self_dead:
+            # 只相信服务器返回的 m_is_done。
+            # 不因为 local_truncated / killed / self_dead 主动 break，
+            # 避免服务器 episode 没结束、下一次评测读到残留状态。
+            if terminated:
                 break
 
-        result = {
-            "model": str(model_path).replace("\\", "/"),
-            "model_name": model_path.name,
-            "episode": episode_idx,
-            "ok": 1,
-            "error": "",
-            "steps": step,
-            "killed": int(killed),
-            "self_dead": int(self_dead),
-            "platform_done": int(terminated_by_done),
-            "timeout_or_max_steps": int(step >= max_steps and not (killed or self_dead or terminated_by_done)),
-            "total_reward": total_reward,
-            "total_damage": total_damage,
-            "total_damage_taken": total_damage_taken,
-            "max_damage_step": max_damage_step,
-            "damage_steps": damage_steps,
-            "final_enemy_hp": float(enemy_state[12]),
-            "final_my_hp": float(my_state[12]),
-            "min_dist_m": min_dist_m,
-            "max_dist_m": max_dist_m,
-            "avg_heading_dot": heading_sum / max(step, 1),
-            "avg_speed_units": speed_sum / max(step, 1),
-            "desertion_steps": desertion_steps,
-            "proximity_steps": proximity_steps,
-            "last_reward_total": float(last_comps.get("total", 0.0)) if last_comps else 0.0,
-        }
+        # 如果 max_steps 跑完后服务器还没返回 terminated，
+        # 继续发送零动作做短暂 drain，尽量等平台自然结束当前 episode。
+        if not result["terminated"] and drain_steps > 0:
+            zero_pack = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
-        # Add useful reward components from the final step for debugging.
-        for k, v in last_comps.items():
-            result[f"last_{k}"] = float(v)
+            for drain_i in range(1, drain_steps + 1):
+                net.send_action_packet(zero_pack)
+
+                raw_obs = net.get_observation_packet()
+                my_state, enemy_state, terminated = split_observation(raw_obs)
+
+                dist_units = float(np.linalg.norm(enemy_state[0:3] - my_state[0:3]))
+                enemy_hp = float(enemy_state[12])
+                self_hp = float(my_state[12])
+                total_damage_hp = max(0.0, (init_enemy_hp - enemy_hp) * 1000.0)
+                speed = float(np.linalg.norm(my_state[6:9]))
+
+                local_truncated = truncate.check_truncation(my_state, enemy_state)
+                killed = enemy_hp <= 0.01
+                self_dead = self_hp <= 0.01
+
+                result["drain_steps"] = drain_i
+                result["enemy_hp"] = enemy_hp
+                result["self_hp"] = self_hp
+                result["total_damage_hp"] = total_damage_hp
+                result["min_distance_m"] = min(result["min_distance_m"], dist_units * 10.0)
+                result["final_distance_m"] = dist_units * 10.0
+                result["final_speed"] = speed
+                result["killed"] = killed
+                result["terminated"] = terminated
+                result["truncated"] = bool(result["truncated"] or local_truncated)
+                result["self_dead"] = self_dead
+
+                if verbose_every > 0 and (terminated or drain_i == 1 or drain_i % verbose_every == 0):
+                    print(
+                        f"[DRAIN {drain_i:04d}] "
+                        f"dist={dist_units * 10.0:8.1f}m "
+                        f"enemy_hp={enemy_hp:.3f} "
+                        f"self_hp={self_hp:.3f} "
+                        f"dmg={total_damage_hp:7.1f} "
+                        f"term={terminated}"
+                    )
+
+                if terminated:
+                    break
 
         return result
 
     except Exception as e:
-        return {
-            "model": str(model_path).replace("\\", "/"),
-            "model_name": model_path.name,
-            "episode": episode_idx,
-            "ok": 0,
-            "error": repr(e),
-            "steps": 0,
-            "killed": 0,
-            "self_dead": 0,
-            "platform_done": 0,
-            "timeout_or_max_steps": 0,
-            "total_reward": 0.0,
-            "total_damage": 0.0,
-            "total_damage_taken": 0.0,
-            "max_damage_step": 0.0,
-            "damage_steps": 0,
-            "final_enemy_hp": np.nan,
-            "final_my_hp": np.nan,
-            "min_dist_m": np.nan,
-            "max_dist_m": np.nan,
-            "avg_heading_dot": np.nan,
-            "avg_speed_units": np.nan,
-            "desertion_steps": 0,
-            "proximity_steps": 0,
-            "last_reward_total": 0.0,
-        }
+        result["error"] = repr(e)
+        return result
 
     finally:
-        if net_my is not None and net_enemy is not None:
-            close_pair(net_my, net_enemy)
+        safe_close(net)
 
 
-def write_csv(path: Path, rows: list[dict]):
-    if not rows:
+def summarize(results):
+    valid = [r for r in results if not r["error"]]
+
+    if not valid:
+        print("[SUMMARY] No valid evaluation results.")
         return
 
-    keys = []
-    seen = set()
-    for row in rows:
-        for k in row.keys():
-            if k not in seen:
-                seen.add(k)
-                keys.append(k)
+    clean_valid = [r for r in valid if r["reset_ok"]]
 
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+    print("\n========== CHECKPOINT SUMMARY: CLEAN RESET EPISODES ONLY ==========")
 
+    if not clean_valid:
+        print("[WARN] No clean-reset episodes. The room was likely not freshly reset or was left mid-episode.")
+        print("       Close the current room, create a new Simple-vs-Fixed room, then rerun.")
+        return
 
-def summarize(rows: list[dict]) -> list[dict]:
-    summaries = []
     by_model = {}
+    for r in clean_valid:
+        by_model.setdefault(r["model"], []).append(r)
 
-    for row in rows:
-        by_model.setdefault(row["model_name"], []).append(row)
+    summary_rows = []
 
-    for model_name, items in by_model.items():
-        ok_items = [r for r in items if int(r["ok"]) == 1]
-        n = len(items)
-        n_ok = len(ok_items)
+    for model_name, rows in sorted(
+        by_model.items(),
+        key=lambda item: parse_step_from_name(Path(item[0]))
+    ):
+        n = len(rows)
+        kill_count = sum(1 for r in rows if r["killed"])
+        trunc_count = sum(1 for r in rows if r["truncated"])
+        term_count = sum(1 for r in rows if r["terminated"])
+        avg_damage = float(np.mean([r["total_damage_hp"] for r in rows]))
+        avg_enemy_hp = float(np.mean([r["enemy_hp"] for r in rows]))
+        avg_steps = float(np.mean([r["steps"] for r in rows]))
+        avg_min_dist = float(np.mean([r["min_distance_m"] for r in rows]))
+        avg_final_dist = float(np.mean([r["final_distance_m"] for r in rows]))
 
-        def mean(key, default=np.nan):
-            vals = [float(r[key]) for r in ok_items if key in r and r[key] == r[key]]
-            return float(np.mean(vals)) if vals else default
-
-        def rate(key):
-            vals = [int(r[key]) for r in ok_items if key in r]
-            return float(np.mean(vals)) if vals else 0.0
-
-        summaries.append({
-            "model_name": model_name,
-            "episodes_requested": n,
-            "episodes_ok": n_ok,
-            "error_count": n - n_ok,
-            "kill_rate": rate("killed"),
-            "self_dead_rate": rate("self_dead"),
-            "max_step_rate": rate("timeout_or_max_steps"),
-            "avg_steps": mean("steps"),
-            "avg_total_reward": mean("total_reward"),
-            "avg_total_damage": mean("total_damage"),
-            "avg_damage_taken": mean("total_damage_taken"),
-            "avg_final_enemy_hp": mean("final_enemy_hp"),
-            "avg_final_my_hp": mean("final_my_hp"),
-            "avg_min_dist_m": mean("min_dist_m"),
-            "avg_max_dist_m": mean("max_dist_m"),
-            "avg_heading_dot": mean("avg_heading_dot"),
-            "avg_speed_units": mean("avg_speed_units"),
-            "avg_desertion_steps": mean("desertion_steps"),
-            "avg_proximity_steps": mean("proximity_steps"),
-            # A rough ranking score. Prefer kill rate, lower self-death, shorter kill time, higher damage.
-            "score": (
-                rate("killed") * 10000.0
-                - rate("self_dead") * 5000.0
-                - mean("steps", 0.0) * 2.0
-                + mean("total_damage", 0.0) * 2.0
-                + mean("avg_heading_dot", 0.0) * 500.0
-            ),
+        summary_rows.append({
+            "model": model_name,
+            "checkpoint_step": parse_step_from_name(Path(model_name)),
+            "episodes": n,
+            "kill_count": kill_count,
+            "kill_rate": kill_count / n,
+            "trunc_count": trunc_count,
+            "trunc_rate": trunc_count / n,
+            "term_count": term_count,
+            "term_rate": term_count / n,
+            "avg_damage_hp": avg_damage,
+            "avg_enemy_hp": avg_enemy_hp,
+            "avg_steps": avg_steps,
+            "avg_min_distance_m": avg_min_dist,
+            "avg_final_distance_m": avg_final_dist,
         })
 
-    summaries.sort(key=lambda r: r["score"], reverse=True)
-    return summaries
+        print(
+            f"{model_name:30s} "
+            f"kill={kill_count}/{n} "
+            f"term={term_count}/{n} "
+            f"trunc={trunc_count}/{n} "
+            f"avg_dmg={avg_damage:7.1f} "
+            f"avg_enemy_hp={avg_enemy_hp:.3f} "
+            f"avg_steps={avg_steps:7.1f} "
+            f"avg_min_dist={avg_min_dist:8.1f}m "
+            f"avg_final_dist={avg_final_dist:8.1f}m"
+        )
+
+    best = sorted(
+        summary_rows,
+        key=lambda x: (
+            x["kill_rate"],
+            x["avg_damage_hp"],
+            -x["trunc_rate"],
+            -x["avg_enemy_hp"],
+        ),
+        reverse=True
+    )[0]
+
+    print("\n[BEST CANDIDATE]")
+    print(
+        f"{best['model']} | "
+        f"kill_rate={best['kill_rate']:.2f}, "
+        f"avg_damage={best['avg_damage_hp']:.1f}, "
+        f"avg_enemy_hp={best['avg_enemy_hp']:.3f}, "
+        f"trunc_rate={best['trunc_rate']:.2f}, "
+        f"avg_min_dist={best['avg_min_distance_m']:.1f}m"
+    )
+
+    unclean_count = len(valid) - len(clean_valid)
+    if unclean_count > 0:
+        print(
+            f"\n[NOTE] {unclean_count} valid episodes were excluded from summary "
+            f"because reset_ok=False."
+        )
+
+
+def save_csv(results, output_csv):
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "model",
+        "model_path",
+        "checkpoint_step",
+        "repeat",
+
+        "initial_distance_m",
+        "reset_distance_m",
+        "reset_enemy_hp",
+        "reset_self_hp",
+        "reset_ok",
+
+        "steps",
+        "drain_steps",
+        "killed",
+        "terminated",
+        "truncated",
+        "self_dead",
+
+        "enemy_hp",
+        "self_hp",
+        "total_damage_hp",
+        "min_distance_m",
+        "final_distance_m",
+        "final_speed",
+
+        "error",
+    ]
+
+    with output_csv.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
+
+    print(f"\n[CSV] Saved evaluation results to: {output_csv}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-dir", type=str, default=None, help="Example: ./output/run_12")
-    parser.add_argument("--models", nargs="*", default=None, help="Explicit checkpoint paths.")
-    parser.add_argument("--episodes", type=int, default=10, help="Episodes per checkpoint.")
-    parser.add_argument("--max-steps", type=int, default=1000, help="Max evaluation steps per episode.")
-    parser.add_argument("--config", type=str, default=CONFIG_PATH)
-    parser.add_argument("--out-dir", type=str, default=None)
-    parser.add_argument("--include-final", action="store_true", help="Include ppo_single_uav.zip if present.")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--output-csv", default=DEFAULT_OUTPUT_CSV)
+    parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--verbose-every", type=int, default=0)
+    parser.add_argument("--drain-steps", type=int, default=80)
+    parser.add_argument("--sleep", type=float, default=0.5)
+
     parser.add_argument(
-        "--only-steps",
+        "--steps",
         nargs="*",
         type=int,
-        default=None,
-        help="Only evaluate these checkpoint step numbers, e.g. --only-steps 30000 35000 40000 45000 50000",
+        default=[5000, 10000, 15000, 20000, 25000, 30000, 50000, 100000],
+        help="Only evaluate checkpoints with these step numbers. Use --steps with no values to evaluate all.",
     )
+
+    parser.add_argument(
+        "--stochastic",
+        action="store_true",
+        help="Use stochastic actions instead of deterministic actions.",
+    )
+
     args = parser.parse_args()
 
-    checkpoints = find_checkpoints(args.run_dir, args.models)
+    deterministic = not args.stochastic
 
-    if not args.include_final:
-        checkpoints = [p for p in checkpoints if p.name != "ppo_single_uav.zip"]
-
-    if args.only_steps:
-        wanted = {f"model_{s}_steps.zip" for s in args.only_steps}
-        checkpoints = [p for p in checkpoints if p.name in wanted]
+    checkpoints = find_checkpoints(args.model_dir, args.steps)
 
     if not checkpoints:
-        raise FileNotFoundError("No checkpoints left after filtering.")
+        print("[ERROR] No checkpoint found.")
+        print(f"model_dir = {args.model_dir}")
+        print(f"steps = {args.steps}")
+        return
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(args.out_dir) if args.out_dir else Path("./output") / f"eval_{timestamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    print("========== EVALUATION CONFIG ==========")
+    print(f"config        : {args.config}")
+    print(f"model_dir     : {args.model_dir}")
+    print(f"output_csv    : {args.output_csv}")
+    print(f"max_steps     : {args.max_steps}")
+    print(f"drain_steps   : {args.drain_steps}")
+    print(f"repeats       : {args.repeats}")
+    print(f"deterministic : {deterministic}")
+    print(f"checkpoints   :")
+    for p in checkpoints:
+        print(f"  - {p}")
 
-    print(f"[INFO] Evaluating {len(checkpoints)} checkpoints")
-    print(f"[INFO] Episodes per checkpoint: {args.episodes}")
-    print(f"[INFO] Max steps per episode: {args.max_steps}")
-    print(f"[INFO] Output directory: {out_dir}")
+    results = []
 
-    all_rows = []
+    for ckpt in checkpoints:
+        print(f"\n========== LOAD MODEL: {ckpt.name} ==========")
+        model = PPO.load(str(ckpt), device="cpu")
 
-    for ckpt_idx, ckpt in enumerate(checkpoints, start=1):
-        print(f"\n[{ckpt_idx}/{len(checkpoints)}] Loading {ckpt}", flush=True)
-        model = PPO.load(str(ckpt))
+        for repeat_id in range(args.repeats):
+            print(f"[EVAL] {ckpt.name} repeat {repeat_id + 1}/{args.repeats}")
 
-        for ep in range(1, args.episodes + 1):
-            print(f"  episode {ep}/{args.episodes} ...", flush=True)
-            row = evaluate_one_episode(
+            r = evaluate_one_episode(
                 model=model,
                 model_path=ckpt,
-                episode_idx=ep,
+                repeat_id=repeat_id,
                 config_path=args.config,
                 max_steps=args.max_steps,
-            )
-            all_rows.append(row)
-
-            status = "OK" if row["ok"] else "ERR"
-            print(
-                f"    {status}: killed={row['killed']} self_dead={row['self_dead']} "
-                f"steps={row['steps']} dmg={row['total_damage']:.1f} "
-                f"enemy_hp={row['final_enemy_hp']}",
-                flush=True,
+                deterministic=deterministic,
+                verbose_every=args.verbose_every,
+                drain_steps=args.drain_steps,
             )
 
-            # Save incrementally, so partial results are preserved if the room crashes.
-            write_csv(out_dir / "checkpoint_episode_results.csv", all_rows)
-            write_csv(out_dir / "checkpoint_summary.csv", summarize(all_rows))
+            results.append(r)
 
-    print("\n[DONE]")
-    print(f"Episode results: {out_dir / 'checkpoint_episode_results.csv'}")
-    print(f"Summary:         {out_dir / 'checkpoint_summary.csv'}")
+            if r["error"]:
+                print(f"  ERROR: {r['error']}")
+            else:
+                print(
+                    f"  reset_ok={r['reset_ok']} "
+                    f"reset_dist={r['reset_distance_m']:.1f}m "
+                    f"reset_enemy_hp={r['reset_enemy_hp']:.3f} "
+                    f"kill={r['killed']} "
+                    f"term={r['terminated']} "
+                    f"steps={r['steps']} "
+                    f"drain={r['drain_steps']} "
+                    f"dmg={r['total_damage_hp']:.1f} "
+                    f"enemy_hp={r['enemy_hp']:.3f} "
+                    f"self_hp={r['self_hp']:.3f} "
+                    f"min_dist={r['min_distance_m']:.1f}m "
+                    f"final_dist={r['final_distance_m']:.1f}m "
+                    f"trunc={r['truncated']}"
+                )
+
+            time.sleep(args.sleep)
+
+    save_csv(results, args.output_csv)
+    summarize(results)
 
 
 if __name__ == "__main__":

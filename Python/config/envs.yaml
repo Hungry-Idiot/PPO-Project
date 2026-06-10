@@ -4,5 +4,5 @@ port: 1000
 #vel_scale: 10
 logger: true
 #train_type: "APPROACH"
-save_path: "../logs/single_training/"
+save_path: "../logs/simple_fixed_1000m/"
 #max_steps: 2000

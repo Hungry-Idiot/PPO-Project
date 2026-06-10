@@ -77,10 +77,6 @@ class TrainEnv(gymnasium.Env):
         self.adaptor = adaptor.NetworkAdaptor(config_path)
         self.adaptor.connect()
 
-        self.adaptor_enemy = adaptor.NetworkAdaptor(config_path)
-        self.adaptor_enemy.port += 1  # 强制顺延到 1001 端口
-        self.adaptor_enemy.connect()
-
         self.first_reset = True
         self.episode_id = 0
 
@@ -99,21 +95,15 @@ class TrainEnv(gymnasium.Env):
         real_action = action.marshal_action(agent_action)
         send_pack = pack_action(real_action, truncated)
 
-        # 构造敌方的零动作并发送
-        enemy_action = np.zeros(4, dtype=np.float64)
-        enemy_send_pack = pack_action(enemy_action, truncated)
-
-        # 双路发送 CtrlData
+        # 单端口 Fixed 靶机环境：只需要发送己方 CtrlData
         self.adaptor.send_action_packet(send_pack)
-        self.adaptor_enemy.send_action_packet(enemy_send_pack)
 
         # Save previous state for reward calculation
         prev_my_state = self.my_state.copy()
         prev_enemy_state = self.enemy_state.copy()
 
-        # 双路接收 BattleData，敌方视角数据不用，但必须接收以清空 TCP 缓冲区
+        # 只接收己方视角 BattleData
         original_observation = self.adaptor.get_observation_packet()
-        _ = self.adaptor_enemy.get_observation_packet()
 
         self.my_state, self.enemy_state, terminated = split_observation(original_observation)
 
@@ -121,13 +111,9 @@ class TrainEnv(gymnasium.Env):
         self.state = observation.marshal_observation(self.my_state, self.enemy_state)
 
         # 接收新状态后再检查一次是否飞出边界
-        # 这样可以处理“本 step 动作导致飞出 1500m”的情况
         new_truncated = truncate.check_truncation(self.my_state, self.enemy_state)
         truncated = truncated or new_truncated
 
-        # Gymnasium 中 terminated 表示自然结束，比如击毁/死亡；
-        # truncated 表示人为截断，比如飞太远。
-        # 如果是飞远截断，就不要同时算作 terminated。
         if truncated:
             terminated = False
 
@@ -138,8 +124,7 @@ class TrainEnv(gymnasium.Env):
             self.enemy_state
         )
 
-        # 飞出边界时，额外给一次截断惩罚。
-        # 目的：不要让 agent 学到“先打一点伤害，然后高速飞离战场”。
+        # 飞出边界时额外重罚
         if truncated:
             remaining_enemy_hp = max(0.0, float(self.enemy_state[12]))
             comps["truncation_penalty"] = -3000.0 - 3000.0 * remaining_enemy_hp
@@ -162,7 +147,7 @@ class TrainEnv(gymnasium.Env):
         super().reset(seed=seed)
 
         # 第一次 reset 使用 __init__ 中已经建立好的连接；
-        # 后续每个 episode reset 都重新连接 1000/1001
+        # 后续每个 episode reset 都重新连接单个端口
         if self.first_reset:
             self.first_reset = False
         else:
@@ -171,31 +156,19 @@ class TrainEnv(gymnasium.Env):
                 print(f"[RESET] reconnect for episode {self.episode_id}", flush=True)
 
             self.adaptor.reconnect()
-            self.adaptor_enemy.reconnect()
 
         # 生成初始状态并拆分
         init_state = initialize.generate_initial_state()
         my_init = init_state[0:12]
         enemy_init = init_state[12:24]
 
-        # 分别打包，注意敌方视角的 my_init 和 enemy_init 是反过来的
+        # Fixed 靶机单端口环境：只需要发送己方视角 InitData
         pack_my = pack_initial(my_init, enemy_init, 1919810)
-        pack_enemy = pack_initial(enemy_init, my_init, 1919811)
-
-        # 双路发送 InitData
         self.adaptor.send_initial_packet(pack_my)
-        self.adaptor_enemy.send_initial_packet(pack_enemy)
 
-        # 关键：Simple vs Simple 需要双方先发 CtrlData 才会返回 BattleData
-        zero_ctrl = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        self.adaptor.send_action_packet(zero_ctrl)
-        self.adaptor_enemy.send_action_packet(zero_ctrl)
-
-        # 必须双路接收 BattleData，敌方视角的数据不用，但必须接收以清空 TCP 缓冲区
+        # Fixed 靶机环境下，InitData 后直接等待平台返回 BattleData
         original_observation = self.adaptor.get_observation_packet()
-        _ = self.adaptor_enemy.get_observation_packet()
 
-        # 仅使用己方视角的数据进行智能体状态处理
         self.my_state, self.enemy_state, termination = split_observation(original_observation)
         self.state = observation.marshal_observation(self.my_state, self.enemy_state)
 

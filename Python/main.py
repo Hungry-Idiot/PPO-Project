@@ -12,11 +12,11 @@ from utils.callback import RewardComponentsCallback
 
 
 def main():
-    run_dir = os.path.join("./output", "run_0")
+    run_dir = os.path.join("./output/simple_fixed_1000m", "run_0")
     i = 0
     while os.path.exists(run_dir):
         i += 1
-        run_dir = os.path.join("./output", f"run_{i}")
+        run_dir = os.path.join("./output/simple_fixed_1000m", f"run_{i}")
     model_dir = os.path.join(run_dir, "model")
     log_dir = os.path.join(run_dir, "logs")
     os.makedirs(model_dir, exist_ok=True)
@@ -64,7 +64,7 @@ def main():
     )
     model.set_logger(logger)
     model.learn(
-        total_timesteps=50000,
+        total_timesteps=100000,
         progress_bar=True,
         reset_num_timesteps=False,
         log_interval=1,

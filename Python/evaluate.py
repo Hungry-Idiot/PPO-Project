@@ -12,20 +12,16 @@ from stable_baselines3 import PPO
 from utils import adaptor, observation, action, initialize
 
 # ==========================================
-MODEL_PATH = "./output/best_simple_model.zip"
+MODEL_PATH = "./output/best_fixed_1000m_model.zip"
 CONFIG_PATH = "./config/envs.yaml"
 # ==========================================
 
 def main():
     model = PPO.load(MODEL_PATH)
 
-    # 1. 初始化双路连接
+    # 1. 初始化连接
     net_my = adaptor.NetworkAdaptor(CONFIG_PATH)
     net_my.connect()
-
-    net_enemy = adaptor.NetworkAdaptor(CONFIG_PATH)
-    net_enemy.port += 1 # 连接到靶机的 1001 端口
-    net_enemy.connect()
 
     # 2. 发送双路初始化包
     init_state = initialize.generate_initial_state()
@@ -43,11 +39,9 @@ def main():
     init_packet_enemy = np.append(init_packet_enemy, my_init)
 
     net_my.send_initial_packet(init_packet_my)
-    net_enemy.send_initial_packet(init_packet_enemy)
 
     # 3. 双路接收初始观测值
     raw_my = net_my.get_observation_packet()
-    _ = net_enemy.get_observation_packet()
 
     my_state = raw_my[0:13].astype(np.float64)
     enemy_state = raw_my[13:26].astype(np.float64)
@@ -66,18 +60,12 @@ def main():
         agent_action, _ = model.predict(obs, deterministic=True)
         real_action = action.marshal_action(agent_action)
         send_pack = np.append(real_action, 0.0)
-        
-        # 靶机决策 (全零无操作滑行)
-        enemy_action = np.zeros(4, dtype=np.float64)
-        enemy_send_pack = np.append(enemy_action, 0.0)
 
         # 双路发送控制指令
         net_my.send_action_packet(send_pack)
-        net_enemy.send_action_packet(enemy_send_pack)
 
         # 双路接收战斗数据
         raw_my = net_my.get_observation_packet()
-        _ = net_enemy.get_observation_packet()
 
         prev_enemy_hp = enemy_state[12]
         my_state = raw_my[0:13].astype(np.float64)
@@ -114,7 +102,6 @@ def main():
     print(f"{'='*50}")
 
     net_my.socket.close()
-    net_enemy.socket.close()
 
 if __name__ == "__main__":
     main()

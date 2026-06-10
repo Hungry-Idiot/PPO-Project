@@ -17,7 +17,7 @@ def marshal_action(action):
 
     # Simple moving target 阶段不需要满油门。
     # 限制最大油门，减少高速冲出战场。
-    processed_action[0] = 0.4 * raw_throttle
+    processed_action[0] = 0.6 * raw_throttle
 
     # 索引 1, 2, 3 分别是俯仰、滚转、偏航，因为它们本身就需要是 [-1, 1]，所以直接透传即可
     
