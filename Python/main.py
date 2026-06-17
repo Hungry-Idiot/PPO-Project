@@ -1,5 +1,5 @@
 """
-main函数，用于训练模型并保存
+main函数，用于训练 Junior fixed target 1000m 模型。
 """
 import os
 from envs.train_env import TrainEnv
@@ -12,23 +12,26 @@ from utils.callback import RewardComponentsCallback
 
 
 def main():
-    run_dir = os.path.join("./output/simple_fixed_1000m", "run_0")
+    run_dir = os.path.join("./output/junior_fixed_1000m", "run_0")
     i = 0
     while os.path.exists(run_dir):
         i += 1
-        run_dir = os.path.join("./output/simple_fixed_1000m", f"run_{i}")
+        run_dir = os.path.join("./output/junior_fixed_1000m", f"run_{i}")
+
     model_dir = os.path.join(run_dir, "model")
     log_dir = os.path.join(run_dir, "logs")
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
     logger = configure(log_dir, ["stdout", "csv"])
+
     checkpoint_callback = CheckpointCallback(
         save_freq=5000,
         save_path=model_dir,
         name_prefix="model",
         save_replay_buffer=True,
     )
+
     reward_callback = RewardComponentsCallback(
         csv_path=os.path.join(log_dir, "reward_components.csv")
     )
@@ -62,16 +65,19 @@ def main():
         device="cpu",
         seed=42,
     )
+
     model.set_logger(logger)
+
     model.learn(
-        total_timesteps=100000,
+        total_timesteps=50000,
         progress_bar=True,
         reset_num_timesteps=False,
         log_interval=1,
         callback=[checkpoint_callback, reward_callback],
     )
-    model.save(os.path.join(model_dir, "ppo_single_uav"))
-    print(f"Model saved to {model_dir}/ppo_single_uav.zip")
+
+    model.save(os.path.join(model_dir, "ppo_junior_fixed_1000m"))
+    print(f"Model saved to {model_dir}/ppo_junior_fixed_1000m.zip")
 
 
 if __name__ == "__main__":

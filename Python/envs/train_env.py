@@ -20,14 +20,11 @@ def float_to_bool(f):
 
 
 def pack_initial(my_init, enemy_init, unit_id):
-    # 转换为整数格式
     integer_my = my_init.astype(np.int32)
     integer_enemy = enemy_init.astype(np.int32)
 
     room = 114514
     initial_packet = np.array([room, unit_id], dtype=np.int32)
-
-    # 依次拼接视角本体数据和对手数据
     initial_packet = np.append(initial_packet, integer_my)
     initial_packet = np.append(initial_packet, integer_enemy)
 
@@ -41,22 +38,17 @@ def split_observation(observation):
     return my_state, enemy_state, terminated
 
 
-def pack_action(action, truncated):
-    if truncated:
-        truncation = 1.0
-    else:
-        truncation = 0.0
-    full_pack = np.append(action, truncation)
-    return full_pack
+def pack_action(real_action, is_done=False):
+    done_flag = 1.0 if is_done else 0.0
+    return np.append(real_action, done_flag).astype(np.float64)
 
 
 class TrainEnv(gymnasium.Env):
     def __init__(self, config_path):
         super().__init__()
 
-        # Agent space bounds
         action_upper_bound = np.ones(shape=[4], dtype=np.float64)
-        action_lower_bound = np.negative(np.ones(shape=[4], dtype=np.float64))
+        action_lower_bound = -np.ones(shape=[4], dtype=np.float64)
         self.action_space = spaces.Box(
             shape=[4],
             dtype=np.float64,
@@ -65,7 +57,7 @@ class TrainEnv(gymnasium.Env):
         )
 
         observation_upper_bound = np.ones(shape=[21], dtype=np.float64)
-        observation_lower_bound = np.negative(np.ones(shape=[21], dtype=np.float64))
+        observation_lower_bound = -np.ones(shape=[21], dtype=np.float64)
         self.observation_space = spaces.Box(
             shape=[21],
             dtype=np.float64,
@@ -73,7 +65,6 @@ class TrainEnv(gymnasium.Env):
             high=observation_upper_bound
         )
 
-        # Initialize adaptor
         self.adaptor = adaptor.NetworkAdaptor(config_path)
         self.adaptor.connect()
 
@@ -83,39 +74,35 @@ class TrainEnv(gymnasium.Env):
         self.my_state, self.enemy_state = None, None
         self.state = None
 
-        with open(config_path, 'r') as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f)
+
         self.save_path = self.config["save_path"]
 
     def step(self, agent_action):
-        # 先根据当前旧状态检查一次是否已经飞出边界
-        truncated = truncate.check_truncation(self.my_state, self.enemy_state)
+        # Junior 阶段：本地安全检查只作为惩罚信号，不作为 done 信号发给平台。
+        was_locally_unsafe = truncate.check_truncation(self.my_state, self.enemy_state)
 
-        # Marshal agent actions into real actions and send
         real_action = action.marshal_action(agent_action)
-        send_pack = pack_action(real_action, truncated)
 
-        # 单端口 Fixed 靶机环境：只需要发送己方 CtrlData
+        # 不再把 local truncation 写入 CtrlData.is_done。
+        # 平台 episode 结束只以服务器 BattleData.m_is_done 为准。
+        send_pack = pack_action(real_action, is_done=False)
         self.adaptor.send_action_packet(send_pack)
 
-        # Save previous state for reward calculation
         prev_my_state = self.my_state.copy()
         prev_enemy_state = self.enemy_state.copy()
 
-        # 只接收己方视角 BattleData
         original_observation = self.adaptor.get_observation_packet()
-
         self.my_state, self.enemy_state, terminated = split_observation(original_observation)
 
-        # Process whole state into agent state
+        if terminated is None:
+            terminated = False
+
         self.state = observation.marshal_observation(self.my_state, self.enemy_state)
 
-        # 接收新状态后再检查一次是否飞出边界
-        new_truncated = truncate.check_truncation(self.my_state, self.enemy_state)
-        truncated = truncated or new_truncated
-
-        if truncated:
-            terminated = False
+        is_locally_unsafe = truncate.check_truncation(self.my_state, self.enemy_state)
+        local_truncated = bool(was_locally_unsafe or is_locally_unsafe)
 
         comps = reward.reward_components(
             prev_my_state,
@@ -124,10 +111,10 @@ class TrainEnv(gymnasium.Env):
             self.enemy_state
         )
 
-        # 飞出边界时额外重罚
-        if truncated:
+        # local_truncated 只惩罚，不结束 episode。
+        if local_truncated:
             remaining_enemy_hp = max(0.0, float(self.enemy_state[12]))
-            comps["truncation_penalty"] = -3000.0 - 3000.0 * remaining_enemy_hp
+            comps["truncation_penalty"] = -800.0 - 1200.0 * remaining_enemy_hp
             comps["total"] += comps["truncation_penalty"]
         else:
             comps["truncation_penalty"] = 0.0
@@ -136,18 +123,18 @@ class TrainEnv(gymnasium.Env):
 
         info = {
             "reward_comps": comps,
+            "local_truncated": local_truncated,
         }
         for k, v in comps.items():
             if k != "total":
                 info[f"r/{k}"] = float(v)
 
-        return self.state, step_reward, terminated, truncated, info
+        # 注意：truncated 固定返回 False，避免 SB3 提前 reset 导致平台不同步。
+        return self.state, step_reward, bool(terminated), False, info
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # 第一次 reset 使用 __init__ 中已经建立好的连接；
-        # 后续每个 episode reset 都重新连接单个端口
         if self.first_reset:
             self.first_reset = False
         else:
@@ -157,24 +144,21 @@ class TrainEnv(gymnasium.Env):
 
             self.adaptor.reconnect()
 
-        # 生成初始状态并拆分
         init_state = initialize.generate_initial_state()
         my_init = init_state[0:12]
         enemy_init = init_state[12:24]
 
-        # Fixed 靶机单端口环境：只需要发送己方视角 InitData
         pack_my = pack_initial(my_init, enemy_init, 1919810)
         self.adaptor.send_initial_packet(pack_my)
 
-        # Fixed 靶机环境下，InitData 后直接等待平台返回 BattleData
         original_observation = self.adaptor.get_observation_packet()
-
         self.my_state, self.enemy_state, termination = split_observation(original_observation)
+
         self.state = observation.marshal_observation(self.my_state, self.enemy_state)
 
         return self.state, {}
 
 
-if __name__ == '__main__':
-    env = TrainEnv('../config/envs.yaml')
+if __name__ == "__main__":
+    env = TrainEnv("../config/envs.yaml")
     env_checker.check_env(env)
